@@ -1,1 +1,5 @@
 data/raw/*
+data/processed/*
+outline.docx
+~$utline.docx
+data/*.xlsx
