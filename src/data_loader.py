@@ -1,10 +1,14 @@
 import pandas as pd
+import os
 from src import config
+from src import utils
 
 def load_weekly_data(file_path):
     """Reads weekly Excel export and returns data split by sheet and patient."""
     xls = pd.ExcelFile(file_path, engine="openpyxl")
     patient_data = {}
+    # loads raw-to-hash mapping
+    mapping = utils.load_id_mapping()
 
     for sheet_name in xls.sheet_names:
         df = xls.parse(sheet_name)
@@ -14,6 +18,25 @@ def load_weekly_data(file_path):
             "Patient Surname": "last_name"
         }
         df = df.rename(columns={col: rename_cols[col] for col in rename_cols if col in df.columns})
+        # anonymize patient emails
+        if "id" in df.columns:
+            for raw in df["id"].unique():
+                fname = df.loc[df["id"] == raw, "first_name"].iloc[0] if "first_name" in df.columns else None
+                lname = df.loc[df["id"] == raw, "last_name"].iloc[0] if "last_name" in df.columns else None
+                if raw not in mapping:
+                    mapping[raw] = {}
+                if "hashed_id" not in mapping[raw]:
+                    mapping[raw]["hashed_id"] = utils.hash_patient_id(raw)
+                if fname is not None:
+                    mapping[raw]["first_name"] = fname
+                if lname is not None:
+                    mapping[raw]["last_name"] = lname
+            # replace emails with hashed IDs
+            df["id"] = df["id"].map(lambda raw: mapping[raw]["hashed_id"])
+            # remove name columns
+            drop_cols = [c for c in ["first_name", "last_name"] if c in df.columns]
+            if drop_cols:
+                df = df.drop(columns=drop_cols)
 
         # remove Doctor Email column from sheet
         if "Doctor Email" in df.columns:
@@ -78,4 +101,5 @@ def load_weekly_data(file_path):
                     patient_data[pid] = {}
                 patient_data[pid][sheet_name] = group.reset_index(drop=True)
 
+    utils.save_id_mapping(mapping)
     return patient_data
