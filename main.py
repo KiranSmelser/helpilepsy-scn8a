@@ -7,6 +7,8 @@ consolidated CSV inside the `data/` directory.
 
 from datetime import datetime
 from pathlib import Path
+import subprocess
+import shutil
 
 from src import config, utils, data_loader, data_writer
 from tqdm import tqdm
@@ -52,6 +54,34 @@ def orchestrate() -> None:
 
     # Consolidated CSV/tables
     data_writer.generate_processed_tables(patients, meds, events, processed_dir)
+
+    # Emit run metadata & update 'latest' pointer
+    try:
+        commit_hash = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+    except Exception:  # noqa: BLE001
+        commit_hash = None
+
+    metadata = {
+        "timestamp": timestamp,
+        "git_commit": commit_hash,
+        "raw_dir": str(raw_dir.resolve()),
+        "processed_dir": str(processed_dir.resolve()),
+    }
+    utils.save_json(metadata, processed_dir / "metadata.json")
+
+    # Refresh the 'latest' symlink
+    latest_link = Path(config.OUTPUT_BASE_DIR) / config.PROCESSED_DIR_NAME / "latest"
+    try:
+        if latest_link.is_symlink() or latest_link.exists():
+            latest_link.unlink()  # remove previous link/dir
+        latest_link.symlink_to(processed_dir.resolve())
+    except Exception:  # noqa: BLE001
+        # Fall back to copying the directory when symlinks aren't supported
+        if latest_link.exists():
+            shutil.rmtree(latest_link)
+        shutil.copytree(processed_dir, latest_link)
 
     tqdm.write("Extraction finished successfully.")
 
