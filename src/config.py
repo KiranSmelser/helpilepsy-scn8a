@@ -29,3 +29,12 @@ EVENT_CONTAINER_KEYS = [
     "nightwatch_reports",
     "nightwatch_seizures",
 ]
+
+# MOOD/SLEEP INGESTION
+from pathlib import Path as _PathAlias 
+
+MOOD_SLEEP_LOCAL_DIR = _PathAlias(OUTPUT_BASE_DIR) / RAW_DIR_NAME / "mood_sleep" 
+MOOD_SLEEP_GLOB = ("*.xlsx", "*.xls", "*.csv")  
+
+# Placeholder for Box integration
+BOX_MOOD_SLEEP_FOLDER_ID: str | None = None

@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import shutil
 
-from src import config, utils, data_loader, data_writer
+from src import config, utils, data_loader, data_writer, mood_sleep_loader
 from tqdm import tqdm
 
 
@@ -54,6 +54,23 @@ def orchestrate() -> None:
 
     # Consolidated CSV/tables
     data_writer.generate_processed_tables(patients, meds, events, processed_dir)
+
+    # Mood & Sleep ingestion 
+    try:
+        patients_csv = processed_dir / "patients.csv"
+        ms_df, _ = mood_sleep_loader.ingest_local(
+            local_dir=config.MOOD_SLEEP_LOCAL_DIR,
+            patients_csv=patients_csv,
+            raw_snapshot_dir=(raw_dir / "mood_sleep"),
+            run_timestamp=timestamp,
+        )
+        mood_sleep_loader.write_outputs(
+            ms_df=ms_df,
+            processed_dir=processed_dir,
+        )
+        tqdm.write("Mood/Sleep ingestion finished.")
+    except Exception as exc:  # noqa: BLE001
+        tqdm.write(f"[warn] Mood/Sleep ingestion skipped due to error: {exc}")
 
     # Emit run metadata & update 'latest' pointer
     try:
