@@ -109,11 +109,10 @@ def generate_processed_tables(  # noqa: C901, PLR0915
     processed_dir: Path,
 ) -> None:
     """
-    Explode *patients*, *meds_by_patient*, and *events_by_patient* into six tables
+    Explode *patients*, *meds_by_patient*, and *events_by_patient* into tidy tables
     and write each to CSV inside *processed_dir*.
 
-    Tables: patients, medications, med_intakes, med_dosages,
-            events, forms, form_answers
+    Tables: patients, medications, events, forms, form_answers
     """
     processed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -124,8 +123,9 @@ def generate_processed_tables(  # noqa: C901, PLR0915
         .assign(run_timestamp=processed_dir.name)  # provenance
     )
 
-    # medications / intakes / dosages
-    med_rows, intake_rows, dose_rows = [], [], []
+    # medications
+    med_rows = []
+    dosage_rows = []
     for pid, med_json in meds_by_patient.items():
         if not (isinstance(med_json, dict) and med_json.get("result")):
             continue
@@ -143,32 +143,51 @@ def generate_processed_tables(  # noqa: C901, PLR0915
                     "updatedAt": med.get("updatedAt"),
                 }
             )
-            for intake in med.get("intakes", []):
-                intake_id = intake.get("_id")
-                intake_rows.append(
-                    {
-                        "intake_id": intake_id,
-                        "medication_id": med_id,
-                        "patient_id": pid,
-                        "from": intake.get("from"),
-                        "to": intake.get("to"),
-                        **{
-                            f"day_{i+1}": d
-                            for i, d in enumerate(intake.get("days", []))
-                        },
-                        "createdAt": intake.get("createdAt"),
-                        "updatedAt": intake.get("updatedAt"),
-                    }
-                )
-                for dosage in intake.get("dosage") or []:
-                    dose_rows.append(
+            # Flatten intake schedules and dosage details
+            for intake in med.get("intakes") or []:
+                if not isinstance(intake, dict):
+                    continue
+                intake_id = intake.get("_id") or intake.get("id")
+                # Standardize days into 7 binary columns
+                days_val = intake.get("days")
+                if isinstance(days_val, list):
+                    days_flags = [1 if bool(x) else 0 for x in days_val[:7]]
+                    # pad to 7 items if shorter
+                    if len(days_flags) < 7:
+                        days_flags += [None] * (7 - len(days_flags))
+                else:
+                    days_flags = [None] * 7
+
+                dosage_list = intake.get("dosage") or []
+                if not isinstance(dosage_list, list):
+                    dosage_list = []
+
+                for d_idx, d in enumerate(dosage_list):
+                    if not isinstance(d, dict):
+                        continue
+                    dosage_rows.append(
                         {
-                            "dosage_id": f"{intake_id}_{dosage.get('moment')}",
-                            "intake_id": intake_id,
+                            # provenance fields
                             "patient_id": pid,
-                            "moment": dosage.get("moment"),
-                            "dose": dosage.get("dose"),
-                            "unit": dosage.get("unit"),
+                            "medication_id": med_id,
+                            "intake_id": intake_id,
+                            "dosage_index": d_idx,
+                            # intake‑level fields
+                            "from": intake.get("from"),
+                            "to": intake.get("to"),
+                            "day_1": days_flags[0],
+                            "day_2": days_flags[1],
+                            "day_3": days_flags[2],
+                            "day_4": days_flags[3],
+                            "day_5": days_flags[4],
+                            "day_6": days_flags[5],
+                            "day_7": days_flags[6],
+                            "intake_createdAt": intake.get("createdAt"),
+                            "intake_updatedAt": intake.get("updatedAt"),
+                            # dosage‑level fields
+                            "moment": d.get("moment"),
+                            "dose": d.get("dose"),
+                            "unit": d.get("unit"),
                         }
                     )
 
@@ -235,8 +254,7 @@ def generate_processed_tables(  # noqa: C901, PLR0915
     tables_to_write = [
         ("patients", patients_df),
         ("medications", pd.DataFrame(med_rows)),
-        ("med_intakes", pd.DataFrame(intake_rows)),
-        ("med_dosages", pd.DataFrame(dose_rows)),
+        ("med_dosages", pd.DataFrame(dosage_rows)),
         ("events", pd.DataFrame(evt_rows)),
         ("forms", pd.DataFrame(form_rows)),
         ("form_answers", pd.DataFrame(ans_rows)),
