@@ -1,21 +1,30 @@
-"""Entry point for Helpilepsy‑SCN8A data extraction.
+"""Entry point for Helpilepsy-SCN8A data extraction.
 
 Authenticates with the Epione Dashboard API, downloads the latest
 patient/medication/event data, and stores the raw JSON as well as a
-consolidated CSV inside the `data/` directory.
+consolidated CSV inside the data/ directory.
 """
 
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 import subprocess
 import shutil
+import pandas as pd
 
-from src import config, utils, data_loader, data_writer, mood_sleep_loader
+from src import (
+    config,
+    utils,
+    data_loader,
+    data_writer,
+    mood_sleep_loader,
+    summary_metrics,
+    summary_graphic,
+)
 from tqdm import tqdm
 
 
 def orchestrate() -> None:
-    """High‑level orchestration of a single extraction run."""
+    """High-level orchestration of a single extraction run."""
     # Credentials
     email, password = utils.load_credentials()
     if not (email and password):
@@ -55,24 +64,44 @@ def orchestrate() -> None:
     # Consolidated CSV/tables
     data_writer.generate_processed_tables(patients, meds, events, processed_dir)
 
-    # Mood & Sleep ingestion 
+    # Mood & Sleep ingestion
     try:
         patients_csv = processed_dir / "patients.csv"
-        ms_df, _ = mood_sleep_loader.ingest_local(
-            local_dir=config.MOOD_SLEEP_LOCAL_DIR,
-            patients_csv=patients_csv,
-            raw_snapshot_dir=(raw_dir / "mood_sleep"),
-            run_timestamp=timestamp,
-        )
+        ms_df = None
+        # Ingest from Box only when configured
+        if getattr(config, "BOX_ACCESS_TOKEN", None) and getattr(
+            config, "BOX_MOOD_SLEEP_FOLDER_ID", None
+        ):
+            ms_df, _ = mood_sleep_loader.ingest_box(
+                folder_id=config.BOX_MOOD_SLEEP_FOLDER_ID,  # type: ignore[arg-type]
+                access_token=config.BOX_ACCESS_TOKEN,  # type: ignore[arg-type]
+                patients_csv=patients_csv,
+                raw_snapshot_dir=(raw_dir / "mood_sleep"),
+                run_timestamp=timestamp,
+            )
+        else:
+            tqdm.write(
+                "[info] Box not configured; skipping mood/sleep ingestion from local directories."
+            )
+
+        # Always write outputs (creates empty file when no data)
         mood_sleep_loader.write_outputs(
-            ms_df=ms_df,
+            ms_df=(ms_df if ms_df is not None else pd.DataFrame()),
             processed_dir=processed_dir,
         )
-        tqdm.write("Mood/Sleep ingestion finished.")
     except Exception as exc:  # noqa: BLE001
         tqdm.write(f"[warn] Mood/Sleep ingestion skipped due to error: {exc}")
 
-    # Emit run metadata & update 'latest' pointer
+    # Patient‑level summary metrics + graphics
+    try:
+        summary_metrics.generate(processed_dir)
+        summary_graphic.generate(processed_dir)
+    except Exception as exc:  # noqa: BLE001
+        tqdm.write(
+            f"[warn] Summary metrics/graphics generation skipped due to error: {exc}"
+        )
+
+    # Emit run metadata & update latest pointer
     try:
         commit_hash = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True

@@ -1,35 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Tuple, List
+from typing import Tuple, List
 import re
 import hashlib
 import shutil
 
 import pandas as pd
 from tqdm import tqdm
+import requests
+import fnmatch
 
 from . import config
 
 
 _LOCKFILE_PREFIXES = ("~$", "._")
-
-
-def _iter_files(root: Path) -> Iterable[Path]:
-    """Yield non-temp files under *root* matching configured patterns."""
-    if not root.exists():
-        return []
-    for pat in config.MOOD_SLEEP_GLOB:
-        for p in root.glob(pat):
-            name = p.name
-            if name.startswith(_LOCKFILE_PREFIXES):
-                continue
-            try:
-                if p.stat().st_size == 0:
-                    continue
-            except OSError:
-                continue
-            yield p
 
 
 def _read_one(path: Path) -> pd.DataFrame:
@@ -71,21 +56,202 @@ def _normalize_names(s: pd.Series) -> pd.Series:
 
 
 def _to_long(df: pd.DataFrame, run_timestamp: str) -> pd.DataFrame:
-    """Standardize df into the canonical long format."""
-    out = df.rename(
-        columns={
-            "Patient Email": "patient_email_raw",
-            "Patient Name": "patient_name_raw",
-            "Patient Surname": "patient_surname_raw",
-            "Date": "datetime_raw",
-            "Event Type": "type",
-            "Value": "value",
-        }
-    ).copy()
-    # Parse timestamps as day-first to match vendor files
+    """Standardize df into the canonical long format.
+
+    Accepts multiple vendor schemas by loosely matching column names.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "patient_email_raw",
+                "patient_name_raw",
+                "patient_surname_raw",
+                "datetime",
+                "type",
+                "value",
+                "email_key",
+                "name_key",
+                "ms_id",
+                "run_timestamp",
+            ]
+        )
+
+    # Normalize column names
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+
+    colmap = {_norm(c): c for c in df.columns}
+
+    def _find(*cands: str) -> str | None:
+        for c in cands:
+            if _norm(c) in colmap:
+                return colmap[_norm(c)]
+        for c in cands:
+            if c in df.columns:
+                return c
+        return None
+
+    # Core fields
+    email_col = _find(
+        "Patient Email", "Email", "Email Address", "E-mail", "PatientEmail"
+    )
+    first_col = _find(
+        "Patient Name", "First Name", "Firstname", "Given Name", "GivenName"
+    )
+    last_col = _find(
+        "Patient Surname",
+        "Last Name",
+        "Lastname",
+        "Surname",
+        "Family Name",
+        "FamilyName",
+    )
+    full_name_col = _find(
+        "Patient", "Patient Full Name", "Name", "Full Name", "PatientName"
+    )
+    date_col = _find(
+        "Date",
+        "Datetime",
+        "Date/Time",
+        "Timestamp",
+        "Recorded At",
+        "Created At",
+        "Event Date",
+    )
+    type_col = _find("Event Type", "Type", "Event", "Parameter", "Metric", "Category")
+    value_col = _find(
+        "Value", "Data Value", "Score", "Amount", "Number", "Measurement", "Quantity"
+    )
+
+    # Wide layout hints
+    mood_wide_col = _find("Mood", "Mood Score", "Mood Rating", "MoodValue")
+    sleep_wide_col = _find(
+        "Sleep",
+        "Sleep Hours",
+        "Sleep Duration",
+        "Sleep Time",
+        "SleepValue",
+        "Sleep Score",
+    )
+
+    work = df.copy()
+
+    rows: list[pd.DataFrame] = []
+
+    if type_col is not None and (
+        value_col is not None or (mood_wide_col or sleep_wide_col)
+    ):
+        # Long schema
+        out = work.copy()
+        out = out.rename(
+            columns={
+                email_col or "patient_email_raw": "patient_email_raw",
+                first_col or "patient_name_raw": "patient_name_raw",
+                last_col or "patient_surname_raw": "patient_surname_raw",
+                date_col or "datetime_raw": "datetime_raw",
+                type_col: "type",
+                **({value_col: "value"} if value_col else {}),
+            }
+        )
+
+        if "value" not in out.columns:
+
+            def _extract_value(r):
+                t = str(r.get("type", "")).strip().lower()
+                if t == "mood" and mood_wide_col:
+                    return r.get(mood_wide_col)
+                if t == "sleep" and sleep_wide_col:
+                    return r.get(sleep_wide_col)
+                return None
+
+            out["value"] = out.apply(_extract_value, axis=1)
+
+        rows.append(out)
+    elif mood_wide_col or sleep_wide_col:
+        # Wide schema
+        base_cols = {}
+        if email_col:
+            base_cols[email_col] = "patient_email_raw"
+        if first_col:
+            base_cols[first_col] = "patient_name_raw"
+        if last_col:
+            base_cols[last_col] = "patient_surname_raw"
+        if date_col:
+            base_cols[date_col] = "datetime_raw"
+
+        out = work.rename(columns=base_cols)
+
+        long_frames: list[pd.DataFrame] = []
+        if mood_wide_col:
+            mm = out.copy()
+            mm["type"] = "mood"
+            mm["value"] = mm[mood_wide_col]
+            long_frames.append(mm)
+        if sleep_wide_col:
+            ss = out.copy()
+            ss["type"] = "sleep"
+            ss["value"] = ss[sleep_wide_col]
+            long_frames.append(ss)
+
+        out = pd.concat(long_frames, ignore_index=True, sort=False)
+        rows.append(out)
+    else:
+        out = work.rename(
+            columns={
+                "Patient Email": "patient_email_raw",
+                "Patient Name": "patient_name_raw",
+                "Patient Surname": "patient_surname_raw",
+                "Date": "datetime_raw",
+                "Event Type": "type",
+                "Value": "value",
+            }
+        )
+        rows.append(out)
+
+    out = pd.concat(rows, ignore_index=True, sort=False)
+
+    # Ensure required columns exist
+    for col in [
+        "patient_email_raw",
+        "patient_name_raw",
+        "patient_surname_raw",
+        "datetime_raw",
+        "type",
+        "value",
+    ]:
+        if col not in out.columns:
+            out[col] = None
+
+    # Build first/last names from full name if needed
+    if (
+        out["patient_name_raw"].isna()
+        | (out["patient_name_raw"].astype(str).str.strip() == "")
+    ).all() and full_name_col:
+        full_series = work[full_name_col].astype(str)
+        firsts = (
+            full_series.str.strip()
+            .str.split()
+            .apply(
+                lambda parts: (
+                    " ".join(parts[:-1])
+                    if len(parts) > 1
+                    else (parts[0] if parts else "")
+                )
+            )
+        )
+        lasts = (
+            full_series.str.strip()
+            .str.split()
+            .apply(lambda parts: parts[-1] if len(parts) > 1 else "")
+        )
+        out["patient_name_raw"] = firsts
+        out["patient_surname_raw"] = lasts
+
+    # Parse timestamps
     out["datetime"] = pd.to_datetime(
         out["datetime_raw"], dayfirst=True, errors="coerce"
     )
+
     # Normalized keys for matching
     out["email_key"] = out["patient_email_raw"].astype(str).str.lower().str.strip()
     out["name_key"] = (
@@ -160,39 +326,106 @@ def _attach_patient_id(df: pd.DataFrame, patients_csv: Path) -> pd.DataFrame:
     return matched
 
 
-def ingest_local(
-    local_dir: Path,
+def _box_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _box_list_items(folder_id: str, token: str) -> list[dict]:
+    """List items in a Box folder, handling pagination via offset."""
+    items: list[dict] = []
+    base_url = f"https://api.box.com/2.0/folders/{folder_id}/items"
+    limit = 1000
+    offset = 0
+    while True:
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "fields": "id,name,size,modified_at",
+        }
+        resp = requests.get(
+            base_url, headers=_box_headers(token), params=params, timeout=30
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Box list error {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+        entries = data.get("entries", [])
+        if not entries:
+            break
+        items.extend(entries)
+        if len(entries) < limit:
+            break
+        offset += len(entries)
+    return items
+
+
+def _box_download_file(file_id: str, filename: str, token: str, dest_dir: Path) -> Path:
+    """Download a file from Box to dest_dir, returning the local Path."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out_path = dest_dir / filename
+    url = f"https://api.box.com/2.0/files/{file_id}/content"
+    with requests.get(url, headers=_box_headers(token), stream=True, timeout=60) as r:
+        if r.status_code not in (200, 302):
+            raise RuntimeError(f"Box download error {r.status_code} for file {file_id}")
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+    return out_path
+
+
+def ingest_box(
+    folder_id: str,
+    access_token: str,
     patients_csv: Path,
     raw_snapshot_dir: Path,
     run_timestamp: str,
 ) -> tuple[pd.DataFrame, Path]:
-    """Ingest local files."""
-    local_dir = Path(local_dir)
-    raw_snapshot_dir = Path(raw_snapshot_dir)
-    raw_snapshot_dir.mkdir(parents=True, exist_ok=True)
+    """Ingest files from a Box folder using a primary access token."""
+    # List items in the folder
+    try:
+        items = _box_list_items(folder_id, access_token)
+    except Exception as exc:  # noqa: BLE001
+        tqdm.write(f"[mood_sleep/box] Failed to list folder items: {exc}")
+        return pd.DataFrame(), raw_snapshot_dir
 
-    files = list(_iter_files(local_dir))
+    # Filter to files that match patterns and are not temp files
+    files: list[dict] = []
+    for it in items:
+        if it.get("type") != "file":
+            continue
+        name = str(it.get("name") or "")
+        if not name or name.startswith(_LOCKFILE_PREFIXES):
+            continue
+        if any(fnmatch.fnmatch(name, pat) for pat in config.MOOD_SLEEP_GLOB):
+            files.append(it)
+
     if not files:
-        tqdm.write(f"[mood_sleep] No files found under {local_dir}.")
+        tqdm.write(f"[mood_sleep/box] No matching files found in folder {folder_id}.")
         return pd.DataFrame(), raw_snapshot_dir
 
     frames: list[pd.DataFrame] = []
-    for f in files:
-        try:
-            df_raw = _read_one(f)
+    with tqdm(total=len(files), desc="Mood/Sleep (Box)", unit="file") as pbar:
+        for it in files:
+            file_id = str(it.get("id"))
+            name = str(it.get("name"))
             try:
-                shutil.copy2(f, raw_snapshot_dir / f.name)
-            except Exception:
-                pass
-            df_long = _to_long(df_raw, run_timestamp)
-            if not df_long.empty:
-                frames.append(df_long)
-            else:
-                tqdm.write(
-                    f"[mood_sleep] No usable rows after normalization in {f.name}."
+                # Download into raw snapshot dir for traceability
+                local_path = _box_download_file(
+                    file_id, name, access_token, raw_snapshot_dir
                 )
-        except Exception as exc:  # noqa: BLE001
-            tqdm.write(f"[mood_sleep] Skipping {f.name}: {exc}")
+                df_raw = _read_one(local_path)
+                df_long = _to_long(df_raw, run_timestamp)
+                if not df_long.empty:
+                    frames.append(df_long)
+                else:
+                    tqdm.write(
+                        f"[mood_sleep/box] No usable rows after normalization in {name}."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                tqdm.write(f"[mood_sleep/box] Skipping {name}: {exc}")
+            finally:
+                pbar.update(1)
 
     if not frames:
         return pd.DataFrame(), raw_snapshot_dir

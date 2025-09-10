@@ -1,4 +1,4 @@
-"""API‑facing functions: login + data download."""
+"""API-facing functions: login + data download."""
 
 from __future__ import annotations
 
@@ -131,27 +131,47 @@ def _get_events(token: str, patient_id: str) -> dict[str, Any] | None:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     now_utc = datetime.now(timezone.utc)
-    to_str = (now_utc + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    to_future = (now_utc + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S.%f")[
+        :-3
+    ] + "Z"
+    to_now = now_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-    params = {
-        "from": "1970-01-01T00:00:00.000Z",
-        "to": to_str,
-        "type": "seizure,headache,appointment,form,side_effect,other,nightwatch_report,nightwatch_seizure",
-    }
+    # Event types
+    base_types = "seizure,headache,appointment,form,side_effect,other,nightwatch_report,nightwatch_seizure"
+    with_reminder = base_types + ",reminder"
 
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=60)
-        data = resp.json()
-        resp.raise_for_status()
-        if isinstance(data, dict) and data.get("success"):
-            return data
-        if isinstance(data, list):
-            return {"success": True, "result": data}
-        tqdm.write(f"Events request failed for {patient_id}: {data}")
-        return None
-    except (json.JSONDecodeError, requests.RequestException) as exc:
-        tqdm.write(f"Error fetching events for {patient_id}: {exc}")
-        return None
+    param_variants = [
+        {"from": "1970-01-01T00:00:00.000Z", "to": to_future, "type": with_reminder},
+        {"from": "1970-01-01T00:00:00.000Z", "to": to_now, "type": with_reminder},
+        {"from": "1970-01-01T00:00:00.000Z", "to": to_future, "type": base_types},
+        {"from": "1970-01-01T00:00:00.000Z", "to": to_now, "type": base_types},
+        {
+            "from": "1970-01-01T00:00:00.000Z",
+            "to": to_now,
+        },  # final fallback without type filter
+    ]
+
+    for attempt, params in enumerate(param_variants, start=1):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=60)
+            # Parse json if possible
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            resp.raise_for_status()
+            if isinstance(data, dict) and data.get("success"):
+                return data
+            if isinstance(data, list):
+                return {"success": True, "result": data}
+            tqdm.write(
+                f"Events request unexpected payload for {patient_id} (attempt {attempt}): {data}"
+            )
+        except (json.JSONDecodeError, requests.RequestException) as exc:
+            if attempt == len(param_variants):
+                tqdm.write(f"Error fetching events for {patient_id}: {exc}")
+                return None
+            continue
 
 
 def _fetch_single_history(

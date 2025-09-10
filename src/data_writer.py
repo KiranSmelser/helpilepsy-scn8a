@@ -19,25 +19,43 @@ def _flatten_events(raw_event_json: dict[str, Any] | None) -> list[dict[str, Any
     if not (raw_event_json and raw_event_json.get("success")):
         return []
 
+    # Map container keys to canonical singular type names used downstream
+    _TYPE_FROM_CONTAINER = {
+        "seizures": "seizure",
+        "side_effects": "side_effect",
+        "appointments": "appointment",
+        "reminders": "reminder",
+        "headaches": "headache",
+        "others": "other",
+        "forms": "form",
+        "nightwatch_reports": "nightwatch_report",
+        "nightwatch_seizures": "nightwatch_seizure",
+    }
+
     flattened: list[dict[str, Any]] = []
     for daily in raw_event_json.get("result", []):
         if not isinstance(daily, dict):
             continue
         for key in config.EVENT_CONTAINER_KEYS:
-            for evt in daily.get(key, []):
-                if isinstance(evt, dict):
-                    evt.setdefault("type", key)
-                    flattened.append(evt)
+            events = daily.get(key) or []
+            for evt in events:
+                if not isinstance(evt, dict):
+                    continue
+                evt_type = (
+                    evt.get("type") or _TYPE_FROM_CONTAINER.get(key) or key.rstrip("s")
+                )
+                evt["type"] = evt_type
+                flattened.append(evt)
     return flattened
 
 
 # HELPERS
 def _write_table(df: pd.DataFrame, root: Path, name: str) -> None:  # noqa: D401
-    """Write *df* to a CSV file named <name>.csv inside *root*. Returns row‑count."""
-    if df.empty:
-        return 0
-
+    """Write *df* to a CSV file named <name>.csv inside *root*."""
     csv_path = root / f"{name}.csv"
+    # Ensure consistent column order
+    if df is None:
+        df = pd.DataFrame()
     df.to_csv(csv_path, index=False)
     return len(df)
 
@@ -60,8 +78,6 @@ def _generate_data_dictionary(root: Path) -> Path:
     """
     Build a Markdown data dictionary for every CSV table in *root* and write it
     to *root/data_dictionary.md*.
-
-    The dictionary records: column name, logical dtype, % non‑null, example value.
     """
     md_lines: list[str] = ["# Data Dictionary", ""]
 
@@ -112,7 +128,7 @@ def generate_processed_tables(  # noqa: C901, PLR0915
     Explode *patients*, *meds_by_patient*, and *events_by_patient* into tidy tables
     and write each to CSV inside *processed_dir*.
 
-    Tables: patients, medications, events, forms, form_answers
+    Tables: patients, medications, med_dosages, med_intakes, events, forms, form_answers
     """
     processed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +142,8 @@ def generate_processed_tables(  # noqa: C901, PLR0915
     # medications
     med_rows = []
     dosage_rows = []
+    # Map to resolve dosage_index for reminder events later on
+    dosage_index_map: dict[tuple, int] = {}
     for pid, med_json in meds_by_patient.items():
         if not (isinstance(med_json, dict) and med_json.get("result")):
             continue
@@ -165,6 +183,20 @@ def generate_processed_tables(  # noqa: C901, PLR0915
                 for d_idx, d in enumerate(dosage_list):
                     if not isinstance(d, dict):
                         continue
+                    # normalized lookup key for later joins with reminder events
+                    try:
+                        key = (
+                            pid,
+                            med_id,
+                            intake_id,
+                            (d.get("moment") or "").strip(),
+                            float(d.get("dose")) if d.get("dose") is not None else None,
+                            (d.get("unit") or "").strip(),
+                        )
+                        if key not in dosage_index_map:
+                            dosage_index_map[key] = d_idx
+                    except Exception:
+                        pass
                     dosage_rows.append(
                         {
                             # provenance fields
@@ -191,8 +223,21 @@ def generate_processed_tables(  # noqa: C901, PLR0915
                         }
                     )
 
-    # events / forms / answers
     evt_rows, form_rows, ans_rows = [], [], []
+    med_intake_rows = []
+    # Map container key -> canonical type if evt lacks one
+    _TYPE_FROM_CONTAINER = {
+        "seizures": "seizure",
+        "side_effects": "side_effect",
+        "appointments": "appointment",
+        "reminders": "reminder",
+        "headaches": "headache",
+        "others": "other",
+        "forms": "form",
+        "nightwatch_reports": "nightwatch_report",
+        "nightwatch_seizures": "nightwatch_seizure",
+    }
+
     for pid, evt_json in events_by_patient.items():
         if not (isinstance(evt_json, dict) and evt_json.get("result")):
             continue
@@ -200,10 +245,18 @@ def generate_processed_tables(  # noqa: C901, PLR0915
             if not isinstance(daily, dict):
                 continue
             for key in config.EVENT_CONTAINER_KEYS:
-                for evt in daily.get(key, []):
+                events = daily.get(key) or []
+                for evt in events:
                     if not isinstance(evt, dict):
                         continue
-                    evt_type = evt.get("type")
+                    evt_type = (
+                        evt.get("type")
+                        or _TYPE_FROM_CONTAINER.get(key)
+                        or key.rstrip("s")
+                    )
+                    # Normalize in-place so downstream logic sees a canonical type
+                    evt["type"] = evt_type
+
                     if evt_type == "form":
                         form_id = evt.get("_id")
                         meta = evt.get("form") or {}
@@ -231,30 +284,159 @@ def generate_processed_tables(  # noqa: C901, PLR0915
                                 }
                             )
                     else:
-                        evt_rows.append(
-                            {
-                                "event_id": evt.get("_id"),
-                                "patient_id": pid,
-                                "type": evt_type,
-                                "date": evt.get("date"),
-                                "duration": evt.get("duration"),
-                                "seizure_type": evt.get("seizure_type"),
-                                "triggers": "|".join(
-                                    map(str, evt.get("triggers") or [])
-                                ),
-                                "felt": evt.get("felt"),
-                                "during_sleep": evt.get("during_sleep"),
-                                "remark": evt.get("remark"),
-                                "createdAt": evt.get("createdAt"),
-                                "updatedAt": evt.get("updatedAt"),
-                            }
-                        )
+                        if evt_type != "reminder":
+                            evt_rows.append(
+                                {
+                                    "event_id": evt.get("_id"),
+                                    "patient_id": pid,
+                                    "type": evt_type,
+                                    "date": evt.get("date"),
+                                    "duration": evt.get("duration"),
+                                    "seizure_type": evt.get("seizure_type"),
+                                    "triggers": "|".join(
+                                        map(str, evt.get("triggers") or [])
+                                    ),
+                                    "felt": evt.get("felt"),
+                                    "during_sleep": evt.get("during_sleep"),
+                                    "remark": evt.get("remark"),
+                                    "createdAt": evt.get("createdAt"),
+                                    "updatedAt": evt.get("updatedAt"),
+                                }
+                            )
+                        # Record medication reminder instances as med_intakes
+                        if evt_type == "reminder":
+                            intake_obj = evt.get("intake") or {}
+                            med_obj = evt.get("medication") or {}
+                            reminder_meta = evt.get("reminder") or {}
+
+                            # Resolve identifiers
+                            intake_id = intake_obj.get("_id") or intake_obj.get("id")
+                            med_id = (
+                                med_obj.get("_id")
+                                or intake_obj.get("medication")
+                                or med_obj.get("id")
+                            )
+
+                            # Determine dose/unit and moment
+                            moment = (evt.get("moment") or "").strip()
+                            dose_val = reminder_meta.get("dose")
+                            unit_val = reminder_meta.get("unit")
+                            if (
+                                dose_val is None or unit_val in (None, "")
+                            ) and isinstance(intake_obj.get("dosage"), list):
+                                for d in intake_obj.get("dosage"):
+                                    if not isinstance(d, dict):
+                                        continue
+                                    if (d.get("moment") or "").strip() == moment:
+                                        dose_val = (
+                                            dose_val
+                                            if dose_val is not None
+                                            else d.get("dose")
+                                        )
+                                        unit_val = unit_val or d.get("unit")
+                                        break
+
+                            # Normalize for dosage_index lookup
+                            try:
+                                dose_num = (
+                                    float(dose_val) if dose_val is not None else None
+                                )
+                            except Exception:
+                                dose_num = None
+                            unit_norm = (unit_val or "").strip()
+
+                            dosage_index = None
+                            try:
+                                key_tuple = (
+                                    pid,
+                                    med_id,
+                                    intake_id,
+                                    moment,
+                                    dose_num,
+                                    unit_norm,
+                                )
+                                dosage_index = dosage_index_map.get(key_tuple)
+                            except Exception:
+                                pass
+
+                            # Intake schedule bounds and weekday flags
+                            days_val = intake_obj.get("days")
+                            if isinstance(days_val, list):
+                                day_flags = [1 if bool(x) else 0 for x in days_val[:7]]
+                                if len(day_flags) < 7:
+                                    day_flags += [None] * (7 - len(day_flags))
+                            else:
+                                day_flags = [None] * 7
+
+                            med_intake_rows.append(
+                                {
+                                    # primary identifiers
+                                    "intake_event_id": evt.get("_id") or evt.get("id"),
+                                    "patient_id": pid,
+                                    "medication_id": med_id,
+                                    "intake_id": intake_id,
+                                    "dosage_index": dosage_index,
+                                    # timing
+                                    "date": evt.get("date"),
+                                    "time": evt.get("time"),
+                                    "real_time": evt.get("real_time"),
+                                    "moment": moment,
+                                    # dose details
+                                    "dose": dose_val,
+                                    "unit": unit_norm,
+                                    # adherence flags
+                                    "taken": evt.get("taken"),
+                                    "taken_date": evt.get("taken_date"),
+                                    # soft‑deletes + provenance
+                                    "deleted": evt.get("deleted"),
+                                    "createdAt": evt.get("createdAt"),
+                                    "updatedAt": evt.get("updatedAt"),
+                                    # schedule context from intake
+                                    "intake_from": intake_obj.get("from"),
+                                    "intake_to": intake_obj.get("to"),
+                                    "day_1": day_flags[0],
+                                    "day_2": day_flags[1],
+                                    "day_3": day_flags[2],
+                                    "day_4": day_flags[3],
+                                    "day_5": day_flags[4],
+                                    "day_6": day_flags[5],
+                                    "day_7": day_flags[6],
+                                }
+                            )
 
     # tables to write
+    med_intake_cols = [
+        "intake_event_id",
+        "patient_id",
+        "medication_id",
+        "intake_id",
+        "dosage_index",
+        "date",
+        "time",
+        "real_time",
+        "moment",
+        "dose",
+        "unit",
+        "taken",
+        "taken_date",
+        "deleted",
+        "createdAt",
+        "updatedAt",
+        "intake_from",
+        "intake_to",
+        "day_1",
+        "day_2",
+        "day_3",
+        "day_4",
+        "day_5",
+        "day_6",
+        "day_7",
+    ]
     tables_to_write = [
         ("patients", patients_df),
         ("medications", pd.DataFrame(med_rows)),
         ("med_dosages", pd.DataFrame(dosage_rows)),
+        ("med_intakes", pd.DataFrame(med_intake_rows, columns=med_intake_cols)),
         ("events", pd.DataFrame(evt_rows)),
         ("forms", pd.DataFrame(form_rows)),
         ("form_answers", pd.DataFrame(ans_rows)),

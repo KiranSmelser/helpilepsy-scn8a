@@ -1,6 +1,8 @@
-"""Centralised configuration constants used across the project."""
+"""Centralized configuration constants used across the project."""
 
 from pathlib import Path
+import json
+from typing import Any
 
 # API ENDPOINTS
 API_URL = "https://api.epione.care/api/v1/dashboard/auth/generate"
@@ -31,10 +33,25 @@ EVENT_CONTAINER_KEYS = [
 ]
 
 # MOOD/SLEEP INGESTION
-from pathlib import Path as _PathAlias 
+# File patterns to consider when ingesting mood/sleep files
+MOOD_SLEEP_GLOB = ("*.xlsx", "*.xls", "*.csv")
 
-MOOD_SLEEP_LOCAL_DIR = _PathAlias(OUTPUT_BASE_DIR) / RAW_DIR_NAME / "mood_sleep" 
-MOOD_SLEEP_GLOB = ("*.xlsx", "*.xls", "*.csv")  
+# Lookback window for computing summary metrics
+METRICS_LOOKBACK_DAYS: int = 90
 
-# Placeholder for Box integration
-BOX_MOOD_SLEEP_FOLDER_ID: str | None = None
+# Box integration
+_BOX_ACCESS_TOKEN: str | None = None
+_BOX_FOLDER_ID: str | None = None
+
+try:
+    with open(CONFIG_FILE, "r", encoding="utf-8") as _fp:
+        _cfg: dict[str, Any] = json.load(_fp)
+    _BOX_ACCESS_TOKEN = _cfg.get("box_access_token") or _cfg.get(
+        "box_primary_access_token"
+    )
+    _BOX_FOLDER_ID = _cfg.get("box_mood_sleep_folder_id") or _cfg.get("box_folder_id")
+except Exception:
+    pass
+
+BOX_ACCESS_TOKEN: str | None = _BOX_ACCESS_TOKEN
+BOX_MOOD_SLEEP_FOLDER_ID: str | None = _BOX_FOLDER_ID
