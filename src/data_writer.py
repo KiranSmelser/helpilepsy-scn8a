@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import re
 import pandas as pd
 import traceback
 from pathlib import Path
@@ -47,6 +48,73 @@ def _flatten_events(raw_event_json: dict[str, Any] | None) -> list[dict[str, Any
                 evt["type"] = evt_type
                 flattened.append(evt)
     return flattened
+
+
+_LANG_PREFERENCE: tuple[str, ...] = ("en", "nl", "fr", "de", "es", "it")
+
+
+def _coerce_text(value: Any) -> str:
+    """Return a human-readable string for value."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _resolve_localized_text(value: Any) -> str:
+    """Extract a localized string from value."""
+    if isinstance(value, dict):
+        for lang in _LANG_PREFERENCE:
+            text = value.get(lang)
+            if text:
+                return _coerce_text(text)
+        for text in value.values():
+            if text:
+                return _coerce_text(text)
+        return ""
+    return _coerce_text(value)
+
+
+def _slugify(text: str) -> str:
+    """Generate a slug suitable for question codes."""
+    if not text:
+        return ""
+    text = text.strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text
+
+
+def _iter_form_questions(evt: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten questions from legacy questions."""
+    records: list[dict[str, Any]] = []
+
+    questions = evt.get("questions") or []
+    for q_idx, question in enumerate(questions):
+        records.append(
+            {
+                "question": question,
+                "section_index": None,
+                "section_label": None,
+                "question_position": q_idx,
+            }
+        )
+
+    sections = evt.get("sections") or []
+    for sec_idx, section in enumerate(sections):
+        section_label = _resolve_localized_text(section.get("name"))
+        for q_idx, question in enumerate(section.get("questions") or []):
+            records.append(
+                {
+                    "question": question,
+                    "section_index": sec_idx,
+                    "section_label": section_label,
+                    "question_position": q_idx,
+                }
+            )
+
+    return records
 
 
 # HELPERS
@@ -272,15 +340,63 @@ def generate_processed_tables(  # noqa: C901, PLR0915
                                 "updatedAt": evt.get("updatedAt"),
                             }
                         )
-                        for q in evt.get("questions") or []:
+                        seen_codes: set[str] = set()
+                        for order, record in enumerate(_iter_form_questions(evt)):
+                            question = record.get("question") or {}
+                            raw_code = question.get("question")
+                            raw_index = question.get("index")
+                            question_index = _coerce_text(raw_index) if raw_index is not None else ""
+                            question_text = _resolve_localized_text(
+                                question.get("questionText")
+                            )
+                            section_label = record.get("section_label")
+                            section_index = record.get("section_index")
+
+                            if raw_code:
+                                question_code = _coerce_text(raw_code)
+                            else:
+                                parts: list[str] = []
+                                if section_label:
+                                    section_slug = _slugify(section_label)
+                                    if section_slug:
+                                        parts.append(section_slug)
+                                if question_index:
+                                    parts.append(f"q{question_index}")
+                                if question_text:
+                                    parts.append(_slugify(question_text))
+                                fallback = f"q{order + 1:03d}"
+                                question_code = "_".join(part for part in parts if part)
+                                if not question_code:
+                                    question_code = fallback
+
+                            canonical = question_code
+                            suffix = 2
+                            while canonical in seen_codes:
+                                canonical = f"{question_code}_{suffix}"
+                                suffix += 1
+                            seen_codes.add(canonical)
+
+                            if raw_code:
+                                if raw_index is not None:
+                                    answer_id = f"{form_id}_{_coerce_text(raw_index)}"
+                                else:
+                                    answer_id = f"{form_id}_None"
+                            else:
+                                answer_id = f"{form_id}_{canonical}"
+
                             ans_rows.append(
                                 {
-                                    "answer_id": f"{form_id}_{q.get('index')}",
+                                    "answer_id": answer_id,
                                     "form_id": form_id,
                                     "patient_id": pid,
-                                    "question_code": q.get("question"),
-                                    "answer_type": q.get("answer_type"),
-                                    "answer": q.get("answer"),
+                                    "question_code": canonical,
+                                    "answer_type": question.get("answer_type"),
+                                    "answer": question.get("answer"),
+                                    "question_index": question_index or None,
+                                    "question_text": question_text or None,
+                                    "section_index": section_index,
+                                    "section_label": section_label or None,
+                                    "is_displayed": question.get("isDisplay"),
                                 }
                             )
                     else:

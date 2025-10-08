@@ -19,6 +19,7 @@ from src import (
     mood_sleep_loader,
     summary_metrics,
     summary_graphic,
+    prospective_survey_loader,
 )
 from tqdm import tqdm
 
@@ -73,8 +74,8 @@ def orchestrate() -> None:
             config, "BOX_MOOD_SLEEP_FOLDER_ID", None
         ):
             ms_df, _ = mood_sleep_loader.ingest_box(
-                folder_id=config.BOX_MOOD_SLEEP_FOLDER_ID,  # type: ignore[arg-type]
-                access_token=config.BOX_ACCESS_TOKEN,  # type: ignore[arg-type]
+                folder_id=config.BOX_MOOD_SLEEP_FOLDER_ID,  
+                access_token=config.BOX_ACCESS_TOKEN, 
                 patients_csv=patients_csv,
                 raw_snapshot_dir=(raw_dir / "mood_sleep"),
                 run_timestamp=timestamp,
@@ -91,6 +92,31 @@ def orchestrate() -> None:
         )
     except Exception as exc:  # noqa: BLE001
         tqdm.write(f"[warn] Mood/Sleep ingestion skipped due to error: {exc}")
+
+    # Prospective survey ingestion
+    try:
+        survey_tables = None
+        if getattr(config, "BOX_ACCESS_TOKEN", None) and getattr(
+            config, "BOX_PROSPECTIVE_SURVEY_FOLDER_ID", None
+        ):
+            survey_tables, _ = prospective_survey_loader.ingest_box(
+                folder_id=config.BOX_PROSPECTIVE_SURVEY_FOLDER_ID,  
+                access_token=config.BOX_ACCESS_TOKEN,  
+                patients_csv=patients_csv,
+                raw_snapshot_dir=(raw_dir / "prospective_survey"),
+                run_timestamp=timestamp,
+                filename_patterns=config.PROSPECTIVE_SURVEY_GLOB,
+            )
+        else:
+            tqdm.write(
+                "[info] Box not configured; skipping prospective survey ingestion."
+            )
+
+        prospective_survey_loader.write_outputs(survey_tables, processed_dir)
+    except Exception as exc:  # noqa: BLE001
+        tqdm.write(
+            f"[warn] Prospective survey ingestion skipped due to error: {exc}"
+        )
 
     # Patient‑level summary metrics + graphics
     try:

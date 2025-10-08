@@ -36,12 +36,18 @@ EVENT_CONTAINER_KEYS = [
 # File patterns to consider when ingesting mood/sleep files
 MOOD_SLEEP_GLOB = ("*.xlsx", "*.xls", "*.csv")
 
+# Prospective survey ingestion
+PROSPECTIVE_SURVEY_GLOB = (
+    "InternationalSCN8ARe-ProspectiveStudy_DATA_*.csv",
+)
+
 # Lookback window for computing summary metrics
 METRICS_LOOKBACK_DAYS: int = 90
 
 # Box integration
 _BOX_ACCESS_TOKEN: str | None = None
 _BOX_FOLDER_ID: str | None = None
+_BOX_PROSPECTIVE_FOLDER_ID: str | None = None
 
 try:
     with open(CONFIG_FILE, "r", encoding="utf-8") as _fp:
@@ -50,8 +56,10 @@ try:
         "box_primary_access_token"
     )
     _BOX_FOLDER_ID = _cfg.get("box_mood_sleep_folder_id") or _cfg.get("box_folder_id")
+    _BOX_PROSPECTIVE_FOLDER_ID = _cfg.get("box_prospective_survey_folder_id")
 except Exception:
     pass
 
 BOX_ACCESS_TOKEN: str | None = _BOX_ACCESS_TOKEN
 BOX_MOOD_SLEEP_FOLDER_ID: str | None = _BOX_FOLDER_ID
+BOX_PROSPECTIVE_SURVEY_FOLDER_ID: str | None = _BOX_PROSPECTIVE_FOLDER_ID

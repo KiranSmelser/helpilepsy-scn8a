@@ -1,20 +1,16 @@
+"""Ingest mood and sleep data from Box."""
+
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Tuple, List
 import re
 import hashlib
-import shutil
 
 import pandas as pd
 from tqdm import tqdm
-import requests
-import fnmatch
 
-from . import config
-
-
-_LOCKFILE_PREFIXES = ("~$", "._")
+from . import config, box_utils
 
 
 def _read_one(path: Path) -> pd.DataFrame:
@@ -326,54 +322,6 @@ def _attach_patient_id(df: pd.DataFrame, patients_csv: Path) -> pd.DataFrame:
     return matched
 
 
-def _box_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}"}
-
-
-def _box_list_items(folder_id: str, token: str) -> list[dict]:
-    """List items in a Box folder, handling pagination via offset."""
-    items: list[dict] = []
-    base_url = f"https://api.box.com/2.0/folders/{folder_id}/items"
-    limit = 1000
-    offset = 0
-    while True:
-        params = {
-            "limit": limit,
-            "offset": offset,
-            "fields": "id,name,size,modified_at",
-        }
-        resp = requests.get(
-            base_url, headers=_box_headers(token), params=params, timeout=30
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Box list error {resp.status_code}: {resp.text[:200]}")
-        data = resp.json()
-        entries = data.get("entries", [])
-        if not entries:
-            break
-        items.extend(entries)
-        if len(entries) < limit:
-            break
-        offset += len(entries)
-    return items
-
-
-def _box_download_file(file_id: str, filename: str, token: str, dest_dir: Path) -> Path:
-    """Download a file from Box to dest_dir, returning the local Path."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    out_path = dest_dir / filename
-    url = f"https://api.box.com/2.0/files/{file_id}/content"
-    with requests.get(url, headers=_box_headers(token), stream=True, timeout=60) as r:
-        if r.status_code not in (200, 302):
-            raise RuntimeError(f"Box download error {r.status_code} for file {file_id}")
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-    return out_path
-
-
 def ingest_box(
     folder_id: str,
     access_token: str,
@@ -384,21 +332,14 @@ def ingest_box(
     """Ingest files from a Box folder using a primary access token."""
     # List items in the folder
     try:
-        items = _box_list_items(folder_id, access_token)
+        files = box_utils.list_files(
+            folder_id,
+            access_token,
+            patterns=config.MOOD_SLEEP_GLOB,
+        )
     except Exception as exc:  # noqa: BLE001
         tqdm.write(f"[mood_sleep/box] Failed to list folder items: {exc}")
         return pd.DataFrame(), raw_snapshot_dir
-
-    # Filter to files that match patterns and are not temp files
-    files: list[dict] = []
-    for it in items:
-        if it.get("type") != "file":
-            continue
-        name = str(it.get("name") or "")
-        if not name or name.startswith(_LOCKFILE_PREFIXES):
-            continue
-        if any(fnmatch.fnmatch(name, pat) for pat in config.MOOD_SLEEP_GLOB):
-            files.append(it)
 
     if not files:
         tqdm.write(f"[mood_sleep/box] No matching files found in folder {folder_id}.")
@@ -411,7 +352,7 @@ def ingest_box(
             name = str(it.get("name"))
             try:
                 # Download into raw snapshot dir for traceability
-                local_path = _box_download_file(
+                local_path = box_utils.download_file(
                     file_id, name, access_token, raw_snapshot_dir
                 )
                 df_raw = _read_one(local_path)
