@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Tuple, List
 import re
 import hashlib
+import math
 
 import pandas as pd
 from tqdm import tqdm
@@ -49,6 +50,84 @@ def _read_one(path: Path) -> pd.DataFrame:
 def _normalize_names(s: pd.Series) -> pd.Series:
     s = s.astype(str).str.replace(r"\s*\(.*?\)\s*", "", regex=True)
     return s.str.strip()
+
+
+_EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _series_looks_like_email(series: pd.Series) -> bool:
+    """Return True when *series* mostly resembles email addresses."""
+    if series is None:
+        return False
+    sample = (
+        series.dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", pd.NA)
+        .dropna()
+    )
+    if sample.empty:
+        return False
+    matches = sample.str.match(_EMAIL_REGEX, na=False)
+    if matches.empty:
+        return False
+    return matches.mean() >= 0.5
+
+
+def _normalize_email(value: object) -> str | None:
+    """Normalize email strings; return None when input is not a plausible email."""
+    if pd.isna(value):
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if _EMAIL_REGEX.match(text):
+        return text
+    return None
+
+
+def _fill_missing_email(frame: pd.DataFrame, fallback_cols: list[str | None]) -> None:
+    """Populate missing patient_email_raw values using fallback columns when possible."""
+    if "patient_email_raw" not in frame.columns:
+        return
+    for col in fallback_cols:
+        if not col or col == "patient_email_raw" or col not in frame.columns:
+            continue
+        series = frame[col]
+        if not _series_looks_like_email(series):
+            continue
+        current = frame["patient_email_raw"]
+        current_norm = current.astype(str).str.strip().str.lower()
+        missing_mask = current.isna() | current_norm.isin(["", "nan", "none"])
+        if not missing_mask.any():
+            break
+        frame.loc[missing_mask, "patient_email_raw"] = series[missing_mask]
+
+
+def _normalize_value_scale(frame: pd.DataFrame) -> pd.DataFrame:
+    """Ensure mood/sleep values follow a 0–10 scale even when exports use 0–1."""
+    if frame.empty or "value" not in frame.columns:
+        return frame
+
+    numeric = pd.to_numeric(frame["value"], errors="coerce")
+    if not numeric.notna().any():
+        frame = frame.copy()
+        frame["value"] = numeric
+        return frame
+
+    frac_mask = (numeric > 0) & (numeric < 1)
+    if frac_mask.any():
+        finite_vals = numeric[numeric.notna()]
+        max_val = finite_vals.max()
+        min_val = finite_vals.min()
+        if pd.notna(max_val) and max_val <= 1.01 and pd.notna(min_val) and min_val >= 0:
+            numeric = (numeric * 10.0).round(2)
+
+    floored = numeric.apply(lambda v: math.floor(v) if pd.notna(v) else v)
+
+    frame = frame.copy()
+    frame["value"] = floored
+    return frame
 
 
 def _to_long(df: pd.DataFrame, run_timestamp: str) -> pd.DataFrame:
@@ -132,6 +211,25 @@ def _to_long(df: pd.DataFrame, run_timestamp: str) -> pd.DataFrame:
 
     work = df.copy()
 
+    patient_id_col = _find("Patient ID", "PatientID", "Patient_Id")
+
+    def _get_series(column: str | None) -> pd.Series | None:
+        if not column:
+            return None
+        try:
+            return df[column]
+        except KeyError:
+            return None
+
+    email_series = _get_series(email_col)
+    id_series = _get_series(patient_id_col)
+
+    if not _series_looks_like_email(email_series) and _series_looks_like_email(
+        id_series
+    ):
+        email_col = patient_id_col
+        email_series = id_series
+
     rows: list[pd.DataFrame] = []
 
     if type_col is not None and (
@@ -162,6 +260,8 @@ def _to_long(df: pd.DataFrame, run_timestamp: str) -> pd.DataFrame:
 
             out["value"] = out.apply(_extract_value, axis=1)
 
+        _fill_missing_email(out, [patient_id_col])
+
         rows.append(out)
     elif mood_wide_col or sleep_wide_col:
         # Wide schema
@@ -190,6 +290,7 @@ def _to_long(df: pd.DataFrame, run_timestamp: str) -> pd.DataFrame:
             long_frames.append(ss)
 
         out = pd.concat(long_frames, ignore_index=True, sort=False)
+        _fill_missing_email(out, [patient_id_col])
         rows.append(out)
     else:
         out = work.rename(
@@ -202,6 +303,7 @@ def _to_long(df: pd.DataFrame, run_timestamp: str) -> pd.DataFrame:
                 "Value": "value",
             }
         )
+        _fill_missing_email(out, [patient_id_col])
         rows.append(out)
 
     out = pd.concat(rows, ignore_index=True, sort=False)
@@ -249,7 +351,7 @@ def _to_long(df: pd.DataFrame, run_timestamp: str) -> pd.DataFrame:
     )
 
     # Normalized keys for matching
-    out["email_key"] = out["patient_email_raw"].astype(str).str.lower().str.strip()
+    out["email_key"] = out["patient_email_raw"].map(_normalize_email)
     out["name_key"] = (
         out["patient_name_raw"].astype(str).str.strip().str.lower()
         + " "
@@ -257,6 +359,7 @@ def _to_long(df: pd.DataFrame, run_timestamp: str) -> pd.DataFrame:
     )
     out["type"] = out["type"].astype(str).str.strip().str.lower()
     out = out[out["type"].isin(["mood", "sleep"])].copy()
+    out = _normalize_value_scale(out)
 
     # Deterministic id
     def _hash_row(r) -> str:

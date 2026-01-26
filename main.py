@@ -20,6 +20,7 @@ from src import (
     summary_metrics,
     summary_graphic,
     prospective_survey_loader,
+    whatsapp_loader,
 )
 from tqdm import tqdm
 
@@ -117,6 +118,30 @@ def orchestrate() -> None:
         tqdm.write(
             f"[warn] Prospective survey ingestion skipped due to error: {exc}"
         )
+
+    # WhatsApp group ingestion
+    try:
+        whatsapp_df = None
+        if getattr(config, "BOX_ACCESS_TOKEN", None) and getattr(
+            config, "BOX_WHATSAPP_GROUP_FOLDER_ID", None
+        ):
+            whatsapp_df, _ = whatsapp_loader.ingest_box(
+                folder_id=config.BOX_WHATSAPP_GROUP_FOLDER_ID,
+                access_token=config.BOX_ACCESS_TOKEN,
+                raw_snapshot_dir=(raw_dir / "whatsapp_group"),
+                run_timestamp=timestamp,
+            )
+        else:
+            tqdm.write(
+                "[info] Box not configured; skipping WhatsApp group ingestion."
+            )
+
+        whatsapp_loader.write_outputs(
+            df=(whatsapp_df if whatsapp_df is not None else pd.DataFrame()),
+            processed_dir=processed_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        tqdm.write(f"[warn] WhatsApp group ingestion skipped due to error: {exc}")
 
     # Patient‑level summary metrics + graphics
     try:

@@ -135,6 +135,32 @@ _HOUR_KEYWORDS = {
     "quarter": 0.25,
 }
 
+_FULL_DAY_PATTERNS = (
+    "all day",
+    "all the time",
+    "whole day",
+    "entire day",
+    "around the clock",
+    "24/7",
+)
+
+_ZERO_HOUR_PATTERNS = (
+    "none yet",
+    "none at the moment",
+    "none right now",
+    "have not",
+    "haven't",
+    "not currently",
+    "not yet",
+    "no hours",
+    "zero hours",
+)
+
+_INVALID_HOUR_RESPONSES = (
+    "same as above",
+    "n/a",
+)
+
 
 @dataclass
 class ProspectiveSurveyTables:
@@ -370,25 +396,66 @@ def _attach_patient_ids(df: pd.DataFrame, patients_csv: Path) -> pd.DataFrame:
 def _parse_hours(value: object) -> float | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
+    if value is pd.NA or value is pd.NaT:
+        return None
     text = str(value).strip().lower()
     if not text:
         return None
-    if text in {"nan", ""}:
+    if text in {"nan", "", "-"}:
         return None
+    normalized = re.sub(r"\s+", " ", text)
+    for invalid in _INVALID_HOUR_RESPONSES:
+        if invalid in normalized:
+            return None
+    for zero in _ZERO_HOUR_PATTERNS:
+        if zero in normalized:
+            return 0.0
+    for phrase in _FULL_DAY_PATTERNS:
+        if phrase in normalized:
+            return 24.0
     for key, val in _HOUR_KEYWORDS.items():
-        if key in text:
+        if key in normalized:
             if "minute" in text or "min" in text:
                 return round(val / 60.0, 3)
             return val
     # Replace commas and extract numeric token
-    cleaned = text.replace(",", ".")
+    cleaned = normalized.replace(",", ".")
     match = re.search(r"(\d+(?:\.\d+)?)", cleaned)
     if not match:
         return None
     hours = float(match.group(1))
-    if any(tok in text for tok in ["minute", "min"]):
+    if any(tok in normalized for tok in ["minute", "min"]):
         return round(hours / 60.0, 3)
     return hours
+
+
+def _normalize_timestamp_value(value: object) -> str | None:
+    if value is None or value is pd.NA or value is pd.NaT:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in {"nan", "none"}:
+        return None
+    parsed = pd.to_datetime(text, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def _normalize_timestamp_columns(df: pd.DataFrame) -> None:
+    timestamp_cols = [col for col in df.columns if str(col).endswith("_timestamp")]
+    if not timestamp_cols:
+        return
+    for col in timestamp_cols:
+        target = f"{col}_utc"
+        if target in df.columns:
+            continue
+        normalized = df[col].apply(_normalize_timestamp_value)
+        df[target] = normalized
 
 
 def _compute_survey_ids(df: pd.DataFrame) -> pd.Series:
@@ -488,6 +555,7 @@ def _prepare_tables(
         return ProspectiveSurveyTables.empty()
 
     df = _attach_patient_ids(df, patients_csv)
+    _normalize_timestamp_columns(df)
 
     if "observationhrsweek_ps" in df.columns:
         df["observationhrsweek_ps_hours"] = df["observationhrsweek_ps"].apply(

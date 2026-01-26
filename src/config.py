@@ -41,13 +41,17 @@ PROSPECTIVE_SURVEY_GLOB = (
     "InternationalSCN8ARe-ProspectiveStudy_DATA_*.csv",
 )
 
+# WhatsApp group ingestion
+WHATSAPP_GROUP_GLOB = ("*.csv",)
+
 # Lookback window for computing summary metrics
-METRICS_LOOKBACK_DAYS: int = 90
+METRICS_LOOKBACK_DAYS: int = 30
 
 # Box integration
 _BOX_ACCESS_TOKEN: str | None = None
 _BOX_FOLDER_ID: str | None = None
 _BOX_PROSPECTIVE_FOLDER_ID: str | None = None
+_BOX_WHATSAPP_FOLDER_ID: str | None = None
 
 try:
     with open(CONFIG_FILE, "r", encoding="utf-8") as _fp:
@@ -57,9 +61,11 @@ try:
     )
     _BOX_FOLDER_ID = _cfg.get("box_mood_sleep_folder_id") or _cfg.get("box_folder_id")
     _BOX_PROSPECTIVE_FOLDER_ID = _cfg.get("box_prospective_survey_folder_id")
+    _BOX_WHATSAPP_FOLDER_ID = _cfg.get("box_whatsapp_group_folder_id")
 except Exception:
     pass
 
 BOX_ACCESS_TOKEN: str | None = _BOX_ACCESS_TOKEN
 BOX_MOOD_SLEEP_FOLDER_ID: str | None = _BOX_FOLDER_ID
 BOX_PROSPECTIVE_SURVEY_FOLDER_ID: str | None = _BOX_PROSPECTIVE_FOLDER_ID
+BOX_WHATSAPP_GROUP_FOLDER_ID: str | None = _BOX_WHATSAPP_FOLDER_ID
