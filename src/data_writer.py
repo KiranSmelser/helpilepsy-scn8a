@@ -209,26 +209,58 @@ def generate_processed_tables(  # noqa: C901, PLR0915
 
     # medications
     med_rows = []
+    med_keys_seen: set[tuple[str, str]] = set()
     dosage_rows = []
     # Map to resolve dosage_index for reminder events later on
     dosage_index_map: dict[tuple, int] = {}
+
+    def _is_deleted_from_deleted(deleted_value: Any) -> bool:
+        """Normalize deleted flag to a strict boolean."""
+        if isinstance(deleted_value, bool):
+            return deleted_value
+        if isinstance(deleted_value, (int, float)):
+            return deleted_value != 0
+        if isinstance(deleted_value, str):
+            return deleted_value.strip().lower() in {"true", "1", "yes", "y"}
+        return False
+
+    def _register_medication_row(
+        patient_id: str, medication_obj: dict[str, Any] | None
+    ) -> str | None:
+        """Append a medication row once per (patient_id, medication_id)."""
+        if not isinstance(medication_obj, dict):
+            return None
+        med_id = medication_obj.get("_id") or medication_obj.get("id")
+        if not med_id:
+            return None
+        med_key = (patient_id, med_id)
+        if med_key in med_keys_seen:
+            return med_id
+        med_rows.append(
+            {
+                "medication_id": med_id,
+                "patient_id": patient_id,
+                "name": medication_obj.get("name"),
+                "reason": medication_obj.get("reason"),
+                "treatment_type": medication_obj.get("treatment_type"),
+                "intake_type": medication_obj.get("intake_type"),
+                "is_deleted": _is_deleted_from_deleted(
+                    medication_obj.get("deleted")
+                ),
+                "createdAt": medication_obj.get("createdAt"),
+                "updatedAt": medication_obj.get("updatedAt"),
+            }
+        )
+        med_keys_seen.add(med_key)
+        return med_id
+
     for pid, med_json in meds_by_patient.items():
         if not (isinstance(med_json, dict) and med_json.get("result")):
             continue
         for med in med_json["result"]:
-            med_id = med.get("_id")
-            med_rows.append(
-                {
-                    "medication_id": med_id,
-                    "patient_id": pid,
-                    "name": med.get("name"),
-                    "reason": med.get("reason"),
-                    "treatment_type": med.get("treatment_type"),
-                    "intake_type": med.get("intake_type"),
-                    "createdAt": med.get("createdAt"),
-                    "updatedAt": med.get("updatedAt"),
-                }
-            )
+            med_id = _register_medication_row(pid, med)
+            if not med_id:
+                continue
             # Flatten intake schedules and dosage details
             for intake in med.get("intakes") or []:
                 if not isinstance(intake, dict):
@@ -432,6 +464,14 @@ def generate_processed_tables(  # noqa: C901, PLR0915
                                 or intake_obj.get("medication")
                                 or med_obj.get("id")
                             )
+                            # Some reminders reference deleted medications that are
+                            # omitted from /medications/all. Backfill these so
+                            # med_intakes always has a matching medications row.
+                            if med_id and (pid, med_id) not in med_keys_seen:
+                                med_payload = med_obj if isinstance(med_obj, dict) else {}
+                                if not (med_payload.get("_id") or med_payload.get("id")):
+                                    med_payload = {**med_payload, "_id": med_id}
+                                _register_medication_row(pid, med_payload)
 
                             # Determine dose/unit and moment
                             moment = (evt.get("moment") or "").strip()
