@@ -21,6 +21,7 @@ from src import (
     summary_graphic,
     prospective_survey_loader,
     whatsapp_loader,
+    manual_data_loader,
 )
 from tqdm import tqdm
 
@@ -142,6 +143,27 @@ def orchestrate() -> None:
         )
     except Exception as exc:  # noqa: BLE001
         tqdm.write(f"[warn] WhatsApp group ingestion skipped due to error: {exc}")
+
+    # Manual caregiver medication/seizure CSV ingestion
+    try:
+        manual_tables = None
+        if getattr(config, "BOX_ACCESS_TOKEN", None) and getattr(
+            config, "BOX_MANUAL_DATA_FOLDER_ID", None
+        ):
+            manual_tables, _ = manual_data_loader.ingest_box(
+                folder_id=config.BOX_MANUAL_DATA_FOLDER_ID,
+                access_token=config.BOX_ACCESS_TOKEN,
+                raw_snapshot_dir=(raw_dir / "manual_data"),
+                run_timestamp=timestamp,
+            )
+        else:
+            tqdm.write(
+                "[info] Box not configured; skipping manual caregiver CSV ingestion."
+            )
+
+        manual_data_loader.write_outputs(manual_tables, processed_dir)
+    except Exception as exc:  # noqa: BLE001
+        tqdm.write(f"[warn] Manual caregiver ingestion skipped due to error: {exc}")
 
     # Patient‑level summary metrics + graphics
     try:
