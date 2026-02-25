@@ -20,6 +20,17 @@ _SEIZURE_REQUIRED_COLS = {"patient_id", "seizure_date", "seizure_time"}
 _TRUE_TOKENS = {"true", "1", "yes", "y"}
 _FALSE_TOKENS = {"false", "0", "no", "n"}
 _NULL_TOKENS = {"", "n/a", "na", "none", "null", "nan"}
+_RESCUE_TEXT_TOKENS = ("rescue", "emergency", "as needed", "as_needed", "prn")
+_RESCUE_STRONG_NAME_TOKENS = (
+    "midazolam",
+    "diazepam",
+    "valtoco",
+    "nayzilam",
+    "diastat",
+    "buccolam",
+    "versed",
+)
+_RESCUE_CONDITIONAL_NAME_TOKENS = ("clonazepam", "klonopin", "lorazepam", "ativan")
 
 
 @dataclass
@@ -65,6 +76,7 @@ class ManualDataTables:
                     "reason",
                     "treatment_type",
                     "intake_type",
+                    "is_rescue_med",
                     "is_deleted",
                     "createdAt",
                     "updatedAt",
@@ -205,6 +217,46 @@ def _null_if_empty(value: object) -> str | None:
     if token.lower() in _NULL_TOKENS:
         return None
     return token
+
+
+def _contains_any_token(text: str, tokens: Iterable[str]) -> bool:
+    haystack = _normalize_text(text).lower()
+    return any(tok in haystack for tok in tokens)
+
+
+def _is_manual_rescue_med(
+    medication_name: object,
+    indication: object,
+    form: object,
+    prn: object,
+    moment: object,
+) -> bool:
+    text = " ".join(
+        part
+        for part in (
+            _normalize_text(medication_name),
+            _normalize_text(indication),
+            _normalize_text(form),
+            _normalize_text(prn),
+            _normalize_text(moment),
+        )
+        if part
+    )
+    if _contains_any_token(text, _RESCUE_TEXT_TOKENS):
+        return True
+    if _contains_any_token(text, _RESCUE_STRONG_NAME_TOKENS):
+        return True
+
+    prn_flag = _to_bool(prn, default=False) or _normalize_text(prn).lower() in {
+        "prn",
+        "as needed",
+        "as_needed",
+    }
+    if _normalize_text(moment).lower() == "prn":
+        prn_flag = True
+    if prn_flag and _contains_any_token(text, _RESCUE_CONDITIONAL_NAME_TOKENS):
+        return True
+    return False
 
 
 def _to_utc_iso(
@@ -379,6 +431,16 @@ def _build_tables(
         meds["dose"] = _series_or_blank(meds, "dose").map(_null_if_empty)
         meds["dose_unit"] = _series_or_blank(meds, "dose_unit").map(_null_if_empty)
         meds = meds[meds["medication_name"].ne("")].copy()
+        meds["is_rescue_med"] = meds.apply(
+            lambda r: _is_manual_rescue_med(
+                r["medication_name"],
+                r.get("indication"),
+                r.get("form"),
+                r.get("prn"),
+                r.get("moment"),
+            ),
+            axis=1,
+        )
         meds["medication_id"] = meds.apply(
             lambda r: _stable_object_id(
                 "manual_medication",
@@ -536,6 +598,7 @@ def _build_tables(
             name=("medication_name", "first"),
             reason=("indication", "first"),
             intake_type=("form", "first"),
+            is_rescue_med=("is_rescue_med", "max"),
             createdAt=("date_iso", "min"),
             updatedAt=("date_iso", "max"),
         )
@@ -549,6 +612,7 @@ def _build_tables(
                 "reason",
                 "treatment_type",
                 "intake_type",
+                "is_rescue_med",
                 "is_deleted",
                 "createdAt",
                 "updatedAt",

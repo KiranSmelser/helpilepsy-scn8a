@@ -51,6 +51,28 @@ def _flatten_events(raw_event_json: dict[str, Any] | None) -> list[dict[str, Any
 
 
 _LANG_PREFERENCE: tuple[str, ...] = ("en", "nl", "fr", "de", "es", "it")
+_RESCUE_TEXT_TOKENS: tuple[str, ...] = (
+    "rescue",
+    "emergency",
+    "as needed",
+    "as_needed",
+    "prn",
+)
+_RESCUE_STRONG_NAME_TOKENS: tuple[str, ...] = (
+    "midazolam",
+    "diazepam",
+    "valtoco",
+    "nayzilam",
+    "diastat",
+    "buccolam",
+    "versed",
+)
+_RESCUE_CONDITIONAL_NAME_TOKENS: tuple[str, ...] = (
+    "clonazepam",
+    "klonopin",
+    "lorazepam",
+    "ativan",
+)
 
 
 def _coerce_text(value: Any) -> str:
@@ -84,6 +106,70 @@ def _slugify(text: str) -> str:
     text = re.sub(r"[^a-z0-9]+", "_", text)
     text = re.sub(r"_+", "_", text).strip("_")
     return text
+
+
+def _contains_any_token(text: str, tokens: tuple[str, ...]) -> bool:
+    haystack = _coerce_text(text).lower()
+    return any(tok in haystack for tok in tokens)
+
+
+def _is_prn_like_intake(intake_obj: dict[str, Any]) -> bool:
+    days = intake_obj.get("days")
+    if isinstance(days, list) and len(days) > 0 and not any(bool(x) for x in days):
+        return True
+
+    specific = intake_obj.get("specific_dosage")
+    if isinstance(specific, dict):
+        moment = _coerce_text(specific.get("moment")).lower()
+        if moment == "prn":
+            return True
+        # API often stores rescue meds as unscheduled specific-dosage intakes.
+        if intake_obj.get("dosage") in (None, [], ""):
+            return True
+
+    moment = _coerce_text(intake_obj.get("moment")).lower()
+    if moment == "prn":
+        return True
+    return False
+
+
+def _is_rescue_medication(medication_obj: dict[str, Any] | None) -> bool:
+    if not isinstance(medication_obj, dict):
+        return False
+
+    text_parts = [
+        medication_obj.get("name"),
+        medication_obj.get("reason"),
+        medication_obj.get("intake_type"),
+        medication_obj.get("treatment_type"),
+        medication_obj.get("remark"),
+        medication_obj.get("notes"),
+    ]
+    med_text = " ".join(_coerce_text(part) for part in text_parts if _coerce_text(part))
+
+    if _contains_any_token(med_text, _RESCUE_TEXT_TOKENS):
+        return True
+
+    for key in ("rescue_medications", "rescues", "emergency_treatments"):
+        value = medication_obj.get(key)
+        if isinstance(value, list):
+            if any(_coerce_text(v).strip() for v in value):
+                return True
+        elif _coerce_text(value).strip():
+            return True
+
+    if _contains_any_token(med_text, _RESCUE_STRONG_NAME_TOKENS):
+        return True
+
+    prn_like = any(
+        _is_prn_like_intake(intake)
+        for intake in (medication_obj.get("intakes") or [])
+        if isinstance(intake, dict)
+    )
+    if prn_like and _contains_any_token(med_text, _RESCUE_CONDITIONAL_NAME_TOKENS):
+        return True
+
+    return False
 
 
 def _iter_form_questions(evt: dict[str, Any]) -> list[dict[str, Any]]:
@@ -244,6 +330,7 @@ def generate_processed_tables(  # noqa: C901, PLR0915
                 "reason": medication_obj.get("reason"),
                 "treatment_type": medication_obj.get("treatment_type"),
                 "intake_type": medication_obj.get("intake_type"),
+                "is_rescue_med": _is_rescue_medication(medication_obj),
                 "is_deleted": _is_deleted_from_deleted(
                     medication_obj.get("deleted")
                 ),
