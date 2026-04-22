@@ -82,6 +82,8 @@ def write_outputs(df: pd.DataFrame, processed_dir: Path) -> None:
         "first_name",
         "last_name",
         "whatsapp",
+        "variant_c",
+        "variant_p",
         "source_file",
         "run_timestamp",
     ]
